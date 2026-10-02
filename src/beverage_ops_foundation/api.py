@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .promo_service import PromoGovernanceService
 from .service import DomainService
 from .storage import Database
 
@@ -48,11 +49,53 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
-        return 404, {"error": "route_not_found", "message": "接口不存在"}
+        return _promo_route(getattr(service, "promo", None), method, parsed.path, body,
+                            actor_id, parse_qs(parsed.query))
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
+
+
+# 促销治理写接口：路径 -> 服务方法名。
+_PROMO_POST_ROUTES = {
+    "/price-products": "publish_product_hierarchy",
+    "/floor-prices": "publish_floor_price",
+    "/channel-contracts": "publish_channel_contract",
+    "/stack-rules": "publish_stack_rule",
+    "/funds": "publish_fund",
+    "/expense-caps": "publish_expense_cap",
+    "/promotions/submit": "submit_promotion",
+    "/promotions/approve": "approve_promotion",
+    "/promotions/reject": "reject_promotion",
+    "/emergency-exceptions/request": "request_emergency_exception",
+    "/emergency-exceptions/review": "review_emergency_exception",
+    "/orders": "create_order",
+    "/settlements": "submit_settlement",
+}
+
+
+def _promo_route(promo: PromoGovernanceService | None, method: str, path: str,
+                 body: dict[str, Any], actor_id: str, query: dict[str, list[str]]
+                 ) -> tuple[int, dict[str, Any]]:
+    if promo is None:
+        return 404, {"error": "route_not_found", "message": "接口不存在"}
+    if method == "POST" and path in _PROMO_POST_ROUTES:
+        result = getattr(promo, _PROMO_POST_ROUTES[path])(actor_id=actor_id, **body)
+        return 200 if result.get("replayed") else 201, result
+    if method == "GET" and path == "/promotions/version":
+        version_id = query.get("promotion_version_id", [""])[0]
+        if not version_id:
+            raise ValidationError("promotion_version_id 不能为空")
+        return 200, promo.get_promotion_version(version_id)
+    if method == "GET" and path == "/expenses/trace":
+        voucher_id = query.get("external_voucher_id", [""])[0]
+        if not voucher_id:
+            raise ValidationError("external_voucher_id 不能为空")
+        version_id = query.get("promotion_version_id", [None])[0]
+        return 200, promo.trace_expense(external_voucher_id=voucher_id,
+                                        promotion_version_id=version_id)
+    return 404, {"error": "route_not_found", "message": "接口不存在"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -99,7 +142,9 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
-    Handler.service = DomainService(database)
+    service = DomainService(database)
+    service.promo = PromoGovernanceService(database)
+    Handler.service = service
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
